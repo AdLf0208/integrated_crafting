@@ -1,0 +1,19 @@
+{
+  "type": "minecraft:block",
+  "random_sequence": "integratedcrafting:blocks/part_interface_crafting",
+  "pools": [
+    {
+      "bonus_rolls": 0.0,
+      "rolls": 1.0,
+      "condition": {
+        "type": "minecraft:survives_explosion"
+      },
+      "entries": [
+        {
+          "type": "minecraft:item",
+          "name": "integratedcrafting:part_interface_crafting"
+        }
+      ]
+    }
+  ]
+}

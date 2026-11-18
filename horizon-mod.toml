@@ -1,0 +1,24 @@
+id = "integratedcrafting"
+name = "Integrated Crafting"
+version = "0.2.0"
+description = """A port of Integrated Crafting for Horizon: a Crafting Interface block that accepts crafting jobs,
+resolves each against the game's own crafting recipes, keeps the recipe for the job's life, holds the
+ingredients in its own slots, and crafts one recipe at a time. The network it attaches to upstream
+(Integrated Dynamics' crafting network) is not ported, so the interface works standalone: ingredients
+come from its own slots and its results stay in its output slots."""
+authors = ["rubensworks (aka kroeser)", "Horizon native mod contributors"]
+# A native mod: Rust in src/, compiled by the launcher against the game build [native] pins,
+# beside data/ and assets/. The id is the resource namespace and the only identity: Cargo's
+# package name and version are not the mod's.
+api = "0.2"
+# "both" is the installation side, not the hook's: an integrated server belongs to the client
+# installation, so a LAN host or a single-player world needs both. A dedicated server is "server".
+side = "both"
+# The one shared value every manifest carries ("May add blocks, items, mob effects and entity
+# types"). This mod carries its interface block, so it is not optional.
+capabilities = ["registries"]
+
+[native]
+game = "26.3"
+horizon = "0b14f8acfd97fa2c750e42795249dcc981178ca4"
+mixins = "e59da9094f0c2fdda6c627fe9eff22dec6a906f0"

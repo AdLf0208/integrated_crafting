@@ -1,0 +1,7 @@
+{
+  "variants": {
+    "": {
+      "model": "integratedcrafting:block/part_interface_crafting"
+    }
+  }
+}
