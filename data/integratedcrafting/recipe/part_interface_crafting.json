@@ -1,31 +1,21 @@
 {
-  "type": "minecraft:crafting_shaped",
   "category": "misc",
   "group": "integratedcrafting:part_interface_crafting",
+  "key": {
+    "C": "minecraft:crafting_table",
+    "I": "#c:ingots/iron",
+    "M": "integrateddynamics:crystalized_menril_chunk",
+    "V": "integrateddynamics:cable",
+    "W": "integrateddynamics:cable"
+  },
   "pattern": [
     "ICI",
     "VMW",
     "ICI"
   ],
-  "key": {
-    "I": {
-      "tag": "c:ingots/iron"
-    },
-    "C": {
-      "item": "minecraft:crafting_table"
-    },
-    "V": {
-      "item": "integrateddynamics:cable"
-    },
-    "M": {
-      "item": "integrateddynamics:crystalized_menril_chunk"
-    },
-    "W": {
-      "item": "integrateddynamics:cable"
-    }
-  },
   "result": {
-    "id": "integratedcrafting:part_interface_crafting",
-    "count": 1
-  }
+    "count": 1,
+    "id": "integratedcrafting:part_interface_crafting"
+  },
+  "type": "minecraft:crafting_shaped"
 }

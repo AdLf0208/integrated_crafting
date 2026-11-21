@@ -1,9 +1,10 @@
 id = "integratedcrafting"
 name = "Integrated Crafting"
-version = "0.2.0"
+version = "0.2.2"
 description = """A port of Integrated Crafting for Horizon: a Crafting Interface block that accepts crafting jobs,
 resolves each against the game's own crafting recipes, keeps the recipe for the job's life, holds the
-ingredients in its own slots, and crafts one recipe at a time. The network it attaches to upstream
+ingredients in its own slots, and crafts one recipe at a time. A job whose ingredient is itself
+craftable plans that dependency first (a log becomes planks, the planks become the requested item). The network it attaches to upstream
 (Integrated Dynamics' crafting network) is not ported, so the interface works standalone: ingredients
 come from its own slots and its results stay in its output slots."""
 authors = ["rubensworks (aka kroeser)", "Horizon native mod contributors"]
@@ -20,5 +21,5 @@ capabilities = ["registries"]
 
 [native]
 game = "26.3"
-horizon = "0b14f8acfd97fa2c750e42795249dcc981178ca4"
+horizon = "0a875da91dbb0fdcb7ba8c42c11341aa229af51a"
 mixins = "e59da9094f0c2fdda6c627fe9eff22dec6a906f0"

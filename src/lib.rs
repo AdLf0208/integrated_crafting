@@ -71,9 +71,13 @@ struct Mod;
 impl Hooks for Mod {
     /// Attach the interface's Part to its block, declare its item slots and the block
     /// entity type the Part owns.
+    ///
+    /// One attachment, not two: `expand_block_entity_parts` copies a block entity's Part into the
+    /// block table with the same name, so an extra `attach_block_part` of the same object is
+    /// refused as `interface is attached to … twice` and **crashes the game at startup**
+    /// (measured 2026-11-19; the SDK's `parts/block_entities.rs:5-33`).
     fn register(&self, r: &mut dyn Registrar, _cx: &RegistrationContext) {
         let block = r.block_key(INTERFACE);
-        r.attach_block_part(block, "interface", Arc::new(Interface));
         r.block_container(&block, support::interface_container());
         let kind = r.declare_block_entity_type("interface", vec![INTERFACE.to_owned()]);
         if let Err(error) = r.attach_block_entity_part(&kind, "interface", Arc::new(Interface)) {

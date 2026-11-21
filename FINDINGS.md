@@ -60,10 +60,14 @@ Dynamics' (`ICraftingNetwork`, registered through `Capabilities.CraftingNetwork`
 Taken: the **job** as an object with an amount, a recipe resolved once and kept,
 ingredients held, one craft at a time, a blocked state with the missing
 ingredients named, completion when the requested amount is made, cancellation,
-and a readout of the queue.
+and a readout of the queue. Slice 2 also takes the **dependency graph**: a
+missing ingredient that is itself craftable is planned first (bounded at eight
+steps, cycles refused), and the chain's reservation is a simulation of what the
+queued jobs still consume and produce.
 
 Left (recorded in `notes.md`): the network (no cross-mod API at this pin), the
 variable-card layer and the part screens, the attuned/enumerated variants, the
-bound machine and its item capability, priorities, distributed jobs, the
-dependency graph (a job whose ingredient is itself craftable), reusable
-ingredients, fluids and energy, the aspects and the terminals integration.
+bound machine and its item capability, priorities, distributed jobs, reusable
+ingredients, fluids and energy, the aspects and the terminals integration, and
+the network form of the dependency graph (separate jobs per unique recipe, with
+merged amounts and priorities).

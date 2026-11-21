@@ -16,13 +16,15 @@
 // and the results stay in its output slots. `notes.md` records that gap by name.
 use mod_api::{
     BlockEntityEvent, BlockEntityTickEvent, BlockEntityTickReply, Command, CommandArgumentValue,
-    CommandInvocation, Compound, Flow, Host, HostTransaction, Identifier, ItemStack, LevelRef,
-    ModContainer, RegisterCommandsEvent, RunModCommandEvent, ServerHost, Tag, Text,
+    CommandInvocation, CommandSource, Compound, ENTITY_ITEMS, Flow, Host, HostTransaction,
+    Identifier, ItemResource, ItemStack, LevelRef, ModContainer, PlayerRef, RegisterCommandsEvent,
+    RunModCommandEvent, ServerHost, Tag, Text,
 };
 
 use crate::INTERFACE;
 use crate::runtime::{
-    Blocked, DEFAULT_OUTPUT_LIMIT, Engine, Job, JobState, Missing, Recipe, Request, Stack, Storage,
+    Blocked, DEFAULT_OUTPUT_LIMIT, Engine, Job, JobState, Missing, REACH_BLOCKS, Recipe, Request,
+    Sink, Stack, Step, Storage, merge_container, within_reach,
 };
 
 /// The ingredient slots: a crafting table's 3×3 grid, in click order.
@@ -38,6 +40,12 @@ pub(crate) const SLOTS: usize = INPUT_SLOTS + OUTPUT_SLOTS;
 const JOBS_TAG: &str = "jobs";
 /// The block entity's saved key for the next job's id.
 const NEXT_TAG: &str = "next_job";
+/// The block entity's saved key for its 13 slots (the one place a command and the tick agree).
+/// Not `items`: that name is the block entity's own container storage, and a payload carrying it
+/// does not come back through `replace_data`.
+const ITEMS_TAG: &str = "ic_slots";
+/// The block entity's saved key for what the interface last wrote into its container.
+const MIRROR_TAG: &str = "ic_mirror";
 
 /// A placed interface gets a block entity for its job queue
 /// (`EntityBlock.newBlockEntity`).
@@ -78,28 +86,54 @@ pub(crate) fn warn_refused(error: impl std::fmt::Display) {
     );
 }
 
-/// One server tick: advance the queue, then save it and the slots back.
+/// One server tick: fold in what a hopper changed, advance the queue, and save the slots back.
+///
+/// The 13 slots live in the block entity's **saved compound** (`ic_slots`, `ic_mirror`), because
+/// that is the one place a command and the tick agree on. Measured in game: a command's
+/// `BlockEntityRef::set_item_slot` write never reached the tick's `event.entity.items`, so a feed
+/// was wiped on the next tick, and a command's `replace_data` *inside* a transaction was rolled
+/// back by it. The tick mirrors the saved slots into the container the hoppers reach and folds a
+/// hopper's change back with [`merge_container`] — for the ingredient **and** the result slots,
+/// and against the state the interface itself last wrote (the mirror), so a hopper that drains a
+/// result is not handed the same stack again every tick.
 pub(crate) fn on_block_entity_tick(
     host: &mut dyn ServerHost,
     event: &mut BlockEntityTickEvent<'_>,
 ) {
-    let loaded = Tag::Compound(event.entity.nbt.clone());
-    let mut engine = read_engine(&loaded);
-    if engine.is_empty() {
-        // Nothing to run: the queue is empty, so the tick changed nothing at all.
-        *event.reply = BlockEntityTickReply::Unchanged;
-        return;
-    }
-    let original = event.entity.items.clone();
-    let mut storage = storage_of(host, &original);
+    let saved = read_storage(&event.entity.nbt);
+    let mirror = read_mirror(&event.entity.nbt);
+    let container = storage_of(host, &event.entity.items);
+    let merged_inputs = merge_container(&saved.inputs, &mirror.inputs, &container.inputs);
+    let merged_outputs = merge_container(&saved.outputs, &mirror.outputs, &container.outputs);
+    let mut storage = Storage::new(merged_inputs, merged_outputs);
+    let mut engine = read_engine(&Tag::Compound(event.entity.nbt.clone()));
     let events = engine.tick(&mut storage);
-    if events.is_empty() {
+    // The container's copy is refreshed from the saved slots whether or not a craft ran, so a
+    // hopper never reads a copy the interface no longer believes.
+    let container_before = event.entity.items.clone();
+    let items = items_of(host, &storage, &container_before);
+    let items_changed = items != container_before;
+    let mut data = event.entity.nbt.clone();
+    save_engine(&mut data, &engine);
+    let written: Vec<Option<Stack>> = storage
+        .inputs
+        .iter()
+        .chain(storage.outputs.iter())
+        .cloned()
+        .collect();
+    write_items(&mut data, &storage.inputs, &storage.outputs, &written);
+    let data_changed = data != event.entity.nbt;
+    if events.is_empty() && !items_changed && !data_changed {
         // A waiting job whose ingredients and slots have not changed yet.
         *event.reply = BlockEntityTickReply::Unchanged;
         return;
     }
-    event.entity.items = items_of(host, &storage, &original);
-    event.entity.nbt = write_engine(&engine);
+    if items_changed {
+        event.entity.items = items;
+    }
+    if data_changed {
+        event.entity.nbt = data;
+    }
 }
 
 /// Read the queue out of a block entity's saved compound; an interface nobody has
@@ -117,28 +151,25 @@ fn read_engine(data: &Tag) -> Engine {
 
 /// One job from its saved compound; `None` for anything malformed (a job this build
 /// cannot read is dropped rather than trusted with the slots).
+///
+/// The chain is saved as its `steps`; a compound written by 0.2.1 has the single recipe's
+/// `cells` at the top level instead, and is read as a one-step job so an upgrade keeps the
+/// jobs an interface was already running.
 fn read_job(tag: &Tag) -> Option<Job> {
-    let cells = match tag.get("cells") {
-        Some(Tag::List(cells)) => cells
-            .iter()
-            .map(|cell| match cell {
-                Tag::List(ids) => Some(ids.iter().filter_map(string_of).collect::<Vec<String>>()),
-                _ => None,
-            })
-            .collect::<Option<Vec<Vec<String>>>>()?,
-        _ => return None,
+    let steps = match tag.get("steps") {
+        Some(Tag::List(steps)) => {
+            let steps: Vec<Step> = steps.iter().map(read_step).collect::<Option<Vec<_>>>()?;
+            if steps.is_empty() {
+                return None;
+            }
+            steps
+        }
+        _ => vec![read_legacy_step(tag)?],
     };
-    if cells.is_empty() || cells.iter().any(Vec::is_empty) {
-        return None;
-    }
-    let recipe = Recipe::new(
-        string(tag, "recipe")?,
-        cells,
-        string(tag, "out")?,
-        count(tag, "out_count")?,
-    );
+    let recipe = steps.last()?.recipe.clone();
     let blocked = match string(tag, "blocked").as_deref() {
         Some("output-full") => Some(Blocked::OutputFull),
+        Some("input-full") => Some(Blocked::InputFull),
         Some("missing") => Some(Blocked::MissingIngredients(read_missing(tag))),
         _ => None,
     };
@@ -148,12 +179,60 @@ fn read_job(tag: &Tag) -> Option<Job> {
         output_limit: count(tag, "limit")?.max(1),
         requested: count(tag, "requested")?,
         produced: count(tag, "produced")?,
-        crafts: count(tag, "crafts")?,
-        crafts_needed: count(tag, "crafts_needed")?,
-        progress: count(tag, "progress")?,
+        steps,
         state: JobState::from_name(&string(tag, "state")?)?,
         blocked,
     })
+}
+
+/// One step of a saved chain.
+fn read_step(tag: &Tag) -> Option<Step> {
+    Some(Step {
+        recipe: Recipe::new(
+            string(tag, "recipe")?,
+            read_cells(tag)?,
+            string(tag, "out")?,
+            count(tag, "out_count")?,
+        ),
+        crafts_needed: count(tag, "crafts_needed")?,
+        crafts: count(tag, "crafts")?,
+        progress: count(tag, "progress")?,
+        sink: Sink::from_name(&string(tag, "sink")?)?,
+        limit: count(tag, "limit")?.max(1),
+    })
+}
+
+/// A one-step job as 0.2.1 saved it: the recipe and its progress at the top level of the job.
+fn read_legacy_step(tag: &Tag) -> Option<Step> {
+    Some(Step {
+        recipe: Recipe::new(
+            string(tag, "recipe")?,
+            read_cells(tag)?,
+            string(tag, "out")?,
+            count(tag, "out_count")?,
+        ),
+        crafts_needed: count(tag, "crafts_needed")?,
+        crafts: count(tag, "crafts")?,
+        progress: count(tag, "progress")?,
+        sink: Sink::Results,
+        limit: count(tag, "limit")?.max(1),
+    })
+}
+
+/// A recipe's ingredient cells as saved: a list of lists of item ids. Empty, or a cell that
+/// names no item, is not a recipe this engine can run.
+fn read_cells(tag: &Tag) -> Option<Vec<Vec<String>>> {
+    let Tag::List(cells) = tag.get("cells")? else {
+        return None;
+    };
+    let cells: Vec<Vec<String>> = cells
+        .iter()
+        .map(|cell| match cell {
+            Tag::List(ids) => Some(ids.iter().filter_map(string_of).collect::<Vec<String>>()),
+            _ => None,
+        })
+        .collect::<Option<Vec<Vec<String>>>>()?;
+    (!cells.is_empty() && cells.iter().all(|cell| !cell.is_empty())).then_some(cells)
 }
 
 /// The saved missing ingredients of a blocked job.
@@ -177,13 +256,16 @@ fn read_missing(tag: &Tag) -> Vec<Missing> {
         .collect()
 }
 
-/// The queue as the block entity saves it.
-fn write_engine(engine: &Engine) -> Compound {
-    let mut data = Compound::new();
-    let jobs = engine.jobs().iter().map(write_job).collect();
-    data.insert(JOBS_TAG.into(), Tag::List(jobs));
-    data.insert(NEXT_TAG.into(), Tag::Int(engine.next_id() as i32));
-    data
+/// Write the queue into the block entity's saved compound, leaving every other key alone: a
+/// payload that replaced the whole compound would drop the interface's slots, which live beside
+/// the queue (measured in game: the request after a feed wiped the items).
+fn save_engine(data: &mut Compound, engine: &Engine) {
+    put(
+        data,
+        JOBS_TAG,
+        Tag::List(engine.jobs().iter().map(write_job).collect()),
+    );
+    put(data, NEXT_TAG, Tag::Int(engine.next_id() as i32));
 }
 
 /// One job as the block entity saves it.
@@ -196,26 +278,17 @@ fn write_job(job: &Job) -> Tag {
     data.insert("limit".into(), Tag::Int(job.output_limit as i32));
     data.insert("requested".into(), Tag::Int(job.requested as i32));
     data.insert("produced".into(), Tag::Int(job.produced as i32));
-    data.insert("crafts".into(), Tag::Int(job.crafts as i32));
-    data.insert("crafts_needed".into(), Tag::Int(job.crafts_needed as i32));
-    data.insert("progress".into(), Tag::Int(job.progress as i32));
     data.insert("state".into(), Tag::String(job.state.name().into()));
-    let cells = job
-        .recipe
-        .ingredients
-        .iter()
-        .map(|cell| {
-            Tag::List(
-                cell.iter()
-                    .map(|id| Tag::String(id.as_str().into()))
-                    .collect(),
-            )
-        })
-        .collect();
-    data.insert("cells".into(), Tag::List(cells));
+    data.insert(
+        "steps".into(),
+        Tag::List(job.steps.iter().map(write_step).collect()),
+    );
     match &job.blocked {
         Some(Blocked::OutputFull) => {
             data.insert("blocked".into(), Tag::String("output-full".into()));
+        }
+        Some(Blocked::InputFull) => {
+            data.insert("blocked".into(), Tag::String("input-full".into()));
         }
         Some(Blocked::MissingIngredients(missing)) => {
             data.insert("blocked".into(), Tag::String("missing".into()));
@@ -238,6 +311,39 @@ fn write_job(job: &Job) -> Tag {
         }
         None => {}
     }
+    Tag::Compound(data)
+}
+
+/// One step of a job's chain as the block entity saves it.
+fn write_step(step: &Step) -> Tag {
+    let mut data = Compound::new();
+    data.insert("recipe".into(), Tag::String(step.recipe.id.as_str().into()));
+    data.insert(
+        "out".into(),
+        Tag::String(step.recipe.output.as_str().into()),
+    );
+    data.insert(
+        "out_count".into(),
+        Tag::Int(step.recipe.output_count as i32),
+    );
+    data.insert("limit".into(), Tag::Int(step.limit as i32));
+    data.insert("crafts_needed".into(), Tag::Int(step.crafts_needed as i32));
+    data.insert("crafts".into(), Tag::Int(step.crafts as i32));
+    data.insert("progress".into(), Tag::Int(step.progress as i32));
+    data.insert("sink".into(), Tag::String(step.sink.name().into()));
+    let cells = step
+        .recipe
+        .ingredients
+        .iter()
+        .map(|cell| {
+            Tag::List(
+                cell.iter()
+                    .map(|id| Tag::String(id.as_str().into()))
+                    .collect(),
+            )
+        })
+        .collect();
+    data.insert("cells".into(), Tag::List(cells));
     Tag::Compound(data)
 }
 
@@ -365,11 +471,32 @@ pub(crate) fn on_run_mod_command(
         reply(host, "Usage: /integratedcrafting <subcommand> <x> <y> <z>");
         return Flow::Cancel;
     };
+    // `status` is a readout of this mod's own block; the three that change an interface act on it
+    // as an ordinary interaction does, so a player must be within reach of it. The console, a
+    // command block and a function are the server's own hand and act anywhere (and `feed` from
+    // one of those has no inventory to take from, so it is refused there for that reason).
+    let player = match event.source {
+        CommandSource::Player { player, .. } => Some(*player),
+        _ => None,
+    };
+    if matches!(subcommand, "request" | "cancel" | "feed")
+        && let Some(player) = player
+        && !player
+            .entity()
+            .position(&*host)
+            .is_some_and(|at| within_reach(at, pos, REACH_BLOCKS))
+    {
+        reply(
+            host,
+            &format!("Integrated Crafting: stand within {REACH_BLOCKS} blocks of the interface."),
+        );
+        return Flow::Cancel;
+    }
     match subcommand {
         "status" => status(host, level, pos),
         "request" => request(host, level, pos, invocation),
         "cancel" => cancel(host, level, pos),
-        "feed" => feed(host, level, pos, invocation),
+        "feed" => feed(host, level, pos, invocation, player),
         _ => reply(
             host,
             "Usage: /integratedcrafting status|request|cancel|feed <x> <y> <z> ...",
@@ -416,8 +543,8 @@ fn request(
         return;
     };
     let output = item.item().id(&*host);
-    let table = recipes_for(&*host, &output);
-    if table.is_empty() {
+    let table = crafting_table(&*host);
+    if Engine::recipe_for(&table, &output).is_none() {
         reply(
             host,
             &format!("Integrated Crafting: no crafting recipe makes {output}"),
@@ -427,9 +554,9 @@ fn request(
     let limit = host
         .max_stack_size(item.item())
         .unwrap_or(DEFAULT_OUTPUT_LIMIT);
-    let items = slots_of(&*host, entity);
-    let storage = storage_of(&*host, &items);
-    let mut engine = read_engine(&Tag::Compound(entity.data(&*host).unwrap_or_default()));
+    let data = entity.data(&*host).unwrap_or_default();
+    let storage = read_storage(&data);
+    let mut engine = read_engine(&Tag::Compound(data.clone()));
     match engine.submit(
         &table,
         &storage,
@@ -437,10 +564,27 @@ fn request(
         limit,
     ) {
         Ok(id) => {
-            reply(
-                host,
-                &format!("Integrated Crafting: job {id} accepted for {wanted} x {output}"),
-            );
+            // A chain names every step, so the acceptance reply says what the interface is going
+            // to make first; a plain request keeps the line it always had.
+            let plan = engine
+                .jobs()
+                .iter()
+                .find(|job| job.id == id)
+                .filter(|job| job.steps.len() > 1)
+                .map(|job| {
+                    job.steps
+                        .iter()
+                        .map(|step| format!("{}x {}", step.crafts_needed, step.recipe.id))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                });
+            let line = match plan {
+                Some(plan) => format!(
+                    "Integrated Crafting: job {id} accepted for {wanted} x {output} (crafts: {plan})"
+                ),
+                None => format!("Integrated Crafting: job {id} accepted for {wanted} x {output}"),
+            };
+            reply(host, &line);
         }
         Err(refusal) => {
             reply(
@@ -468,9 +612,17 @@ fn cancel(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3]) {
     );
 }
 
-/// `/integratedcrafting feed`: put items into the input slots, as a hopper above the
-/// interface does.
-fn feed(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3], invocation: &CommandInvocation) {
+/// `/integratedcrafting feed`: move items from the acting player's inventory into the input slots,
+/// as a hopper above the interface does — the items are the player's, and nothing is created. The
+/// inventory extraction and the slot writes share one transaction, so a slot the game refuses
+/// never costs the player an item, and an item that left the inventory always lands in a slot.
+fn feed(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    pos: [i32; 3],
+    invocation: &CommandInvocation,
+    player: Option<PlayerRef>,
+) {
     let Some(entity) = interface_at(host, level, pos) else {
         reply(host, "Integrated Crafting: no crafting interface there.");
         return;
@@ -489,46 +641,268 @@ fn feed(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3], invocation: &
         );
         return;
     };
-    let read: &dyn Host = &*host;
-    let items = slots_of(read, entity);
-    let model = storage_of(read, &items).inputs;
-    let limit = read
-        .max_stack_size(item.item())
-        .unwrap_or(DEFAULT_OUTPUT_LIMIT);
-    let (planned, inserted) = plan_insert(&model, &item.item().id(read), wanted, limit);
-    match write_slots(host, entity, &model, &planned) {
-        Some(()) => reply(
+    let Some(player) = player else {
+        reply(
+            host,
+            "Integrated Crafting: /feed moves items out of the player's inventory, so it needs a player.",
+        );
+        return;
+    };
+    let key = item.item();
+    let resource = ItemResource::of(item);
+    let data = entity.data(&*host).unwrap_or_default();
+    let saved = read_storage(&data);
+    let (id, limit) = {
+        let read: &dyn Host = &*host;
+        (
+            key.id(read),
+            read.max_stack_size(key).unwrap_or(DEFAULT_OUTPUT_LIMIT),
+        )
+    };
+    let model = saved.inputs.clone();
+    let Some(source) = player.entity().capability(host, &ENTITY_ITEMS, ()) else {
+        reply(
+            host,
+            "Integrated Crafting: that player's inventory is not reachable.",
+        );
+        return;
+    };
+    let mut available = 0u32;
+    for index in 0..source.size(host) {
+        if source
+            .resource(host, index)
+            .is_some_and(|held| held.item() == key)
+        {
+            available += source.amount(host, index);
+        }
+    }
+    if available == 0 {
+        reply(
+            host,
+            &format!("Integrated Crafting: the player holds no {id} to feed."),
+        );
+        return;
+    }
+    // The player's own items are the cost: never more than they hold.
+    let wanted = wanted.min(available);
+    let (planned, inserted) = plan_insert(&model, &id, wanted, limit);
+    if inserted == 0 {
+        reply(
+            host,
+            "Integrated Crafting: the input slots refused the items.",
+        );
+        return;
+    }
+    let mut after = data.clone();
+    // The feed changes the saved slots only. The mirror stays what the interface last wrote into
+    // the container, so the next tick sees that container as unchanged and keeps the fed items.
+    write_slots(&mut after, &planned, &saved.outputs);
+    // The player is charged first, then the slots are written: a `replace_data` that followed a
+    // transaction on the same block entity was rolled back by it at this pin (measured in game),
+    // and charging first means a refused write hands the items back instead of duplicating them.
+    let taken = host
+        .transaction(|host, tx| {
+            let mut taken = 0;
+            for index in 0..source.size(host) {
+                if taken == inserted {
+                    break;
+                }
+                let Some(held) = source.resource(host, index) else {
+                    continue;
+                };
+                if held.item() != key {
+                    continue;
+                }
+                taken += source.extract(host, tx, index, &resource, inserted - taken);
+            }
+            // Not enough in the inventory: nothing moves and nothing is created.
+            Ok::<u32, ()>(taken)
+        })
+        .unwrap_or(0);
+    if taken != inserted {
+        let _ = host.transaction(|host, tx| {
+            let mut left = taken;
+            for index in 0..source.size(host) {
+                if left == 0 {
+                    break;
+                }
+                if source
+                    .resource(host, index)
+                    .is_some_and(|held| held.item() == key)
+                {
+                    left -= source.insert(host, tx, index, &resource, left);
+                }
+            }
+            Ok::<(), ()>(())
+        });
+        reply(
+            host,
+            "Integrated Crafting: the player does not hold that many.",
+        );
+        return;
+    }
+    let written = entity.replace_data(host, after).is_ok();
+    if !written {
+        // Hand the items back: the slots refused the write, so nothing may be kept.
+        let _ = host.transaction(|host, tx| {
+            let mut left = inserted;
+            for index in 0..source.size(host) {
+                if left == 0 {
+                    break;
+                }
+                if source
+                    .resource(host, index)
+                    .is_some_and(|held| held.item() == key)
+                {
+                    left -= source.insert(host, tx, index, &resource, left);
+                }
+            }
+            Ok::<(), ()>(())
+        });
+    }
+    let outcome = written.then_some(()).ok_or(());
+    match outcome {
+        Ok(()) => reply(
             host,
             &format!("Integrated Crafting: inserted {inserted} of {wanted}"),
         ),
-        None => reply(
+        Err(_) => reply(
             host,
-            "Integrated Crafting: the input slots refused the items.",
+            "Integrated Crafting: the interface refused the items.",
         ),
     }
 }
 
-/// The stacks in an interface's slots, read one by one.
-fn slots_of(host: &dyn Host, entity: mod_api::BlockEntityRef) -> Vec<Option<ItemStack>> {
-    (0..SLOTS as u32)
-        .map(|slot| entity.item_slot(host, slot).ok().flatten())
-        .collect()
+/// The interface's 13 slots as its saved compound holds them: the first [`INPUT_SLOTS`] are the
+/// ingredients, the rest the results.
+fn read_storage(data: &Compound) -> Storage {
+    split_slots(read_slots(data, ITEMS_TAG))
 }
 
-/// The pure recipes for `output`, resolved from the game's crafting table.
+/// What the interface last wrote into its container, in the same layout.
+fn read_mirror(data: &Compound) -> Storage {
+    split_slots(read_slots(data, MIRROR_TAG))
+}
+
+/// `SLOTS` saved slots split into the engine's ingredient and result lists.
+fn split_slots(all: Vec<Option<Stack>>) -> Storage {
+    let mut inputs: Vec<Option<Stack>> = all.iter().take(INPUT_SLOTS).cloned().collect();
+    inputs.resize(INPUT_SLOTS, None);
+    let mut outputs: Vec<Option<Stack>> = all
+        .into_iter()
+        .skip(INPUT_SLOTS)
+        .take(OUTPUT_SLOTS)
+        .collect();
+    outputs.resize(OUTPUT_SLOTS, None);
+    Storage::new(inputs, outputs)
+}
+
+/// One slot list of a saved compound, `SLOTS` entries long: a list of compounds, each holding
+/// `item` and `count`; an empty slot is a compound without them. A shorter or longer list is
+/// padded or cut, so a damaged save behaves as empty slots rather than shifting the grid.
+fn read_slots(data: &Compound, key: &str) -> Vec<Option<Stack>> {
+    let mut slots: Vec<Option<Stack>> = Vec::with_capacity(SLOTS);
+    if let Some(Tag::List(list)) = field(data, key) {
+        for entry in list.iter() {
+            slots.push(match entry {
+                Tag::Compound(fields) => field_string(fields, "item")
+                    .zip(field_count(fields, "count"))
+                    .filter(|(_, count)| *count > 0)
+                    .map(|(item, count)| Stack::new(item, count)),
+                _ => None,
+            });
+        }
+    }
+    slots.resize(SLOTS, None);
+    slots.truncate(SLOTS);
+    slots
+}
+
+/// A compound's field, by name. The key type is UTF-16 and the API does not export it, so a key
+/// is taken from `Tag::String`'s own payload (the same conversion a mod's NBT string uses, with no
+/// name needed) — the shape moderndynamics' save code uses.
+fn field<'a>(data: &'a Compound, name: &str) -> Option<&'a Tag> {
+    let Tag::String(key) = Tag::String(name.into()) else {
+        return None;
+    };
+    data.get(&key)
+}
+
+/// Insert `value` into a compound under `name`.
+fn put(data: &mut Compound, name: &str, value: Tag) {
+    if let Tag::String(key) = Tag::String(name.into()) {
+        data.insert(key, value);
+    }
+}
+
+/// A text field of a nested compound.
+fn field_string(fields: &Compound, key: &str) -> Option<String> {
+    string_of(field(fields, key)?)
+}
+
+/// An unsigned integer field of a nested compound.
+fn field_count(fields: &Compound, key: &str) -> Option<u32> {
+    match field(fields, key) {
+        Some(Tag::Int(value)) => u32::try_from(*value).ok(),
+        Some(Tag::Long(value)) => u32::try_from(*value).ok(),
+        _ => None,
+    }
+}
+
+/// Write the interface's slots into its saved compound, and the mirror of the state they were
+/// written to.
 ///
-/// A recipe's cells are its ingredient item ids, deduplicated and sorted so the saved
-/// job and its readout do not depend on a set's iteration order. `Ingredient::item_keys`
-/// is the exact, component-independent membership; a custom predicate it cannot
-/// enumerate falls back to the ingredient's display order, which a job then matches by
-/// item id alone.
-fn recipes_for(host: &dyn Host, output: &str) -> Vec<Recipe> {
+/// The mirror is **what the interface last wrote into its container**, not what the container
+/// happened to show before the write. A hopper that takes a result then differs from the mirror and
+/// wins, so the saved slots lose the item; a mirror holding the pre-write state instead re-inserts
+/// the same stack every tick and a hopper under the interface duplicates the job's output (measured
+/// in game: an eight-plank job left twelve planks in the chest, and a one-interface craft left four
+/// interfaces — fixed in 0.2.2, pinned by the exact chest counts in `tools/e2e.sh` phases B, G, I).
+fn write_items(
+    data: &mut Compound,
+    inputs: &[Option<Stack>],
+    outputs: &[Option<Stack>],
+    written: &[Option<Stack>],
+) {
+    write_slots(data, inputs, outputs);
+    let mirror: Vec<Tag> = written.iter().map(slot_tag).collect();
+    put(data, MIRROR_TAG, Tag::List(mirror));
+}
+
+/// Write only the interface's slots, leaving the container mirror as it stands: what a command
+/// that changes the saved slots (a feed) does, because it does not touch the container itself.
+fn write_slots(data: &mut Compound, inputs: &[Option<Stack>], outputs: &[Option<Stack>]) {
+    let slots: Vec<Tag> = inputs.iter().chain(outputs.iter()).map(slot_tag).collect();
+    put(data, ITEMS_TAG, Tag::List(slots));
+}
+
+/// One slot as its saved compound: `item` and `count`, or an empty compound.
+fn slot_tag(slot: &Option<Stack>) -> Tag {
+    let Some(stack) = slot else {
+        return Tag::Compound(Compound::new());
+    };
+    let mut fields = Compound::new();
+    put(&mut fields, "item", Tag::String(stack.item.as_str().into()));
+    put(&mut fields, "count", Tag::Int(stack.count as i32));
+    Tag::Compound(fields)
+}
+
+/// Every `minecraft:crafting` recipe the game has, with each ingredient cell as its item ids.
+///
+/// The engine needs the whole table, not just the requested output's recipes: an ingredient cell
+/// can name any item of a tag, and any of those may itself be craftable, so the dependency planner
+/// asks this table for a recipe of a cell's candidate. It is built once per request (a command,
+/// never a tick). A recipe's cells are deduplicated and sorted so the saved job and its readout do
+/// not depend on a set's iteration order. `Ingredient::item_keys` is the exact,
+/// component-independent membership; a custom predicate it cannot enumerate falls back to the
+/// ingredient's display order, which a job then matches by item id alone.
+fn crafting_table(host: &dyn Host) -> Vec<Recipe> {
     let mut table = Vec::new();
     for recipe in host.recipes_of_type("minecraft:crafting").iter() {
         let Some(result) = recipe.results.first() else {
             continue;
         };
-        if result.item().id(host) != output || recipe.ingredients.is_empty() {
+        if recipe.ingredients.is_empty() {
             continue;
         }
         let mut cells = Vec::with_capacity(recipe.ingredients.len());
@@ -551,7 +925,7 @@ fn recipes_for(host: &dyn Host, output: &str) -> Vec<Recipe> {
         table.push(Recipe::new(
             recipe.id.clone(),
             cells,
-            output.to_owned(),
+            result.item().id(host),
             result.count(),
         ));
     }
@@ -593,35 +967,11 @@ fn plan_insert(
     (planned, count - remaining)
 }
 
-/// Write the ingredient slots that changed, in one transaction. `None` when the game
-/// refused a write (the transaction is rolled back, so a failure leaves the slots as
-/// they were).
-fn write_slots(
-    host: &mut dyn ServerHost,
-    entity: mod_api::BlockEntityRef,
-    original: &[Option<Stack>],
-    planned: &[Option<Stack>],
-) -> Option<()> {
-    let items = slots_of(&*host, entity);
-    let mut writes = Vec::new();
-    for (slot, wanted) in planned.iter().enumerate() {
-        if original.get(slot) == Some(wanted) {
-            continue;
-        }
-        writes.push((slot as u32, rebuild(&*host, wanted, items.get(slot))));
-    }
-    let outcome = host.transaction(|host, tx| {
-        for (slot, stack) in &writes {
-            entity.set_item_slot(host, tx, *slot, stack.clone())?;
-        }
-        Ok::<(), mod_api::BlockEntityItemError>(())
-    });
-    outcome.ok()
-}
-
-/// The queue written back into the block entity's saved compound.
+/// The queue written back into the block entity's saved compound, beside its slots.
 fn save(host: &mut dyn ServerHost, entity: mod_api::BlockEntityRef, engine: &Engine) {
-    if let Err(error) = entity.replace_data(host, write_engine(engine)) {
+    let mut data = entity.data(&*host).unwrap_or_default();
+    save_engine(&mut data, engine);
+    if let Err(error) = entity.replace_data(host, data) {
         reply(
             host,
             &format!("Integrated Crafting: the interface refused its job data ({error:?})"),
@@ -676,6 +1026,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_saved_slots_round_trip() {
+        let mut data = Compound::new();
+        let inputs = vec![
+            Some(Stack::new("minecraft:oak_log", 2)),
+            None,
+            Some(Stack::new("minecraft:stick", 7)),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ];
+        let outputs = vec![
+            Some(Stack::new("minecraft:oak_planks", 4)),
+            None,
+            None,
+            None,
+        ];
+        write_items(&mut data, &inputs, &outputs, &[]);
+        let storage = read_storage(&data);
+        assert_eq!(storage.inputs, inputs, "the ingredients come back");
+        assert_eq!(storage.outputs, outputs, "the results come back");
+        assert_eq!(
+            read_mirror(&data).inputs,
+            vec![None; INPUT_SLOTS],
+            "the mirror records what the container showed: nothing, here"
+        );
+        // An untouched compound is 13 empty slots, not a short list.
+        assert_eq!(read_storage(&Compound::new()).inputs.len(), INPUT_SLOTS);
+        assert_eq!(read_storage(&Compound::new()).outputs.len(), OUTPUT_SLOTS);
+    }
+
+    #[test]
     fn a_saved_queue_reads_back_as_it_was_written() {
         let mut engine = Engine::new();
         let storage = Storage::new(
@@ -696,7 +1080,9 @@ mod tests {
                 64,
             )
             .expect("two logs pay for eight planks");
-        let saved = Tag::Compound(write_engine(&engine));
+        let mut data = Compound::new();
+        save_engine(&mut data, &engine);
+        let saved = Tag::Compound(data);
         assert_eq!(read_engine(&saved), engine);
     }
 
@@ -725,7 +1111,9 @@ mod tests {
             engine.tick(&mut storage);
         }
         assert_eq!(engine.jobs()[0].state, JobState::Blocked);
-        let saved = Tag::Compound(write_engine(&engine));
+        let mut data = Compound::new();
+        save_engine(&mut data, &engine);
+        let saved = Tag::Compound(data);
         let restored = read_engine(&saved);
         assert_eq!(restored, engine);
         assert_eq!(
@@ -739,6 +1127,114 @@ mod tests {
     fn an_interface_nobody_used_has_an_empty_queue() {
         let data = Tag::Compound(Compound::new());
         assert!(read_engine(&data).is_empty());
+    }
+
+    #[test]
+    fn a_job_saved_by_the_previous_package_reads_as_one_step() {
+        // 0.2.1 saved a job's single recipe and its progress at the top level of the job compound.
+        // An interface that is mid-job when the package is upgraded must keep it.
+        let mut job = Compound::new();
+        job.insert("id".into(), Tag::Int(3));
+        job.insert("recipe".into(), Tag::String("minecraft:oak_planks".into()));
+        job.insert("out".into(), Tag::String("minecraft:oak_planks".into()));
+        job.insert("out_count".into(), Tag::Int(4));
+        job.insert("limit".into(), Tag::Int(64));
+        job.insert("requested".into(), Tag::Int(8));
+        job.insert("produced".into(), Tag::Int(0));
+        job.insert("crafts".into(), Tag::Int(1));
+        job.insert("crafts_needed".into(), Tag::Int(2));
+        job.insert("progress".into(), Tag::Int(5));
+        job.insert("state".into(), Tag::String("running".into()));
+        job.insert(
+            "cells".into(),
+            Tag::List(vec![Tag::List(vec![Tag::String(
+                "minecraft:oak_log".into(),
+            )])]),
+        );
+        let mut data = Compound::new();
+        data.insert(JOBS_TAG.into(), Tag::List(vec![Tag::Compound(job)]));
+        let engine = read_engine(&Tag::Compound(data));
+        assert_eq!(engine.jobs().len(), 1, "the old job was not dropped");
+        let job = &engine.jobs()[0];
+        assert_eq!(job.state, JobState::Running);
+        assert_eq!(job.steps.len(), 1);
+        assert_eq!(job.recipe.output, "minecraft:oak_planks");
+        assert_eq!(job.steps[0].sink, Sink::Results);
+        assert_eq!(job.steps[0].crafts, 1);
+        assert_eq!(job.steps[0].progress, 5);
+        assert_eq!(job.steps[0].crafts_needed, 2);
+    }
+
+    #[test]
+    fn a_saved_chain_reads_back_with_its_steps() {
+        let mut engine = Engine::new();
+        let mut storage = Storage::new(
+            vec![Some(Stack::new("minecraft:oak_log", 1))],
+            vec![None, None],
+        );
+        let planks = Recipe::new(
+            "minecraft:oak_planks",
+            vec![vec!["minecraft:oak_log".to_owned()]],
+            "minecraft:oak_planks",
+            4,
+        );
+        let sticks = Recipe::new(
+            "minecraft:stick",
+            vec![
+                vec!["minecraft:oak_planks".to_owned()],
+                vec!["minecraft:oak_planks".to_owned()],
+            ],
+            "minecraft:stick",
+            4,
+        );
+        engine
+            .submit(
+                &[planks, sticks],
+                &storage,
+                &Request::new("minecraft:stick", 4),
+                64,
+            )
+            .expect("one log pays for the chain");
+        engine.tick(&mut storage);
+        let mut data = Compound::new();
+        save_engine(&mut data, &engine);
+        let restored = read_engine(&Tag::Compound(data));
+        assert_eq!(
+            restored, engine,
+            "the chain and its progress survive a save"
+        );
+        assert_eq!(restored.jobs()[0].steps.len(), 2);
+        assert_eq!(restored.jobs()[0].steps[0].sink, Sink::Inputs);
+        assert_eq!(restored.jobs()[0].steps[1].sink, Sink::Results);
+        assert!(
+            restored.readout([0, 0, 0])[1].contains("step 1/2"),
+            "the restored readout still names the step"
+        );
+    }
+
+    #[test]
+    fn a_mirror_of_the_written_state_lets_a_hopper_take_a_result() {
+        // The tick writes the slots and remembers the state it wrote. A hopper that takes one of
+        // the results then differs from the mirror and wins (the item has left); an emptied slot
+        // wins too. With a mirror of the *pre-write* container instead, the saved stack came back
+        // every tick and a hopper under the interface duplicated the job's output (measured in
+        // game: 12 planks for an eight-plank job before this fix).
+        let saved = vec![Some(Stack::new("minecraft:oak_planks", 8))];
+        let written = saved.clone();
+        assert_eq!(
+            merge_container(
+                &saved,
+                &written,
+                &[Some(Stack::new("minecraft:oak_planks", 7))]
+            ),
+            vec![Some(Stack::new("minecraft:oak_planks", 7))]
+        );
+        assert_eq!(merge_container(&saved, &written, &[]), vec![None]);
+        // The feed changes only the saved slots; the mirror stays the container's last state, so a
+        // container nothing touched keeps the fed items.
+        let fed = vec![Some(Stack::new("minecraft:oak_log", 2))];
+        let last_written = vec![None];
+        assert_eq!(merge_container(&fed, &last_written, &[]), fed);
     }
 
     #[test]

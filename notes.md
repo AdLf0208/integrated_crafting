@@ -1,4 +1,4 @@
-# Integrated Crafting → Horizon (slice 1)
+# Integrated Crafting → Horizon (slice 1: the engine and the interface; slice 2: the dependency graph)
 
 Port of **Integrated Crafting 1.8.1** (`CyclopsMC/IntegratedCrafting`, **MIT** per the jar's
 `META-INF/neoforge.mods.toml`), Minecraft 1.21.1 NeoForge, from the exact ATM10 pack jar:
@@ -156,6 +156,325 @@ Checked, and **none found** that this slice would reproduce. What was checked, f
   "ingredients are held by the job" rule, and "a running job keeps its recipe" are upstream's own
   documented behaviour and are implemented, not changed.
 
+## Review fixes (2026-11-18) — the registry's source review, package 0.2.1
+
+The reviewer's file is `var/review/1270-integratedcrafting.md` (**held: this blocked listing**).
+Every item is a change in the tree plus the test or run that pins it. New package:
+**`integratedcrafting.hmod` — 40,878 B, sha256 `0798935ecaaaff52301b2160ae580deae33f34b1daf927d25b2170b9d479d4fc`**,
+`check` = `integratedcrafting 0.2.1 (native-mod, …)`, `fits --build nightly` = `0b14f8a made for`.
+
+### 1. The level-0 `feed` command created items in any loaded interface
+
+**Reproduced** (`src/support.rs:334` in 0.2.0, into `plan_insert`/`write_slots`): `feed <pos> <item>
+<count>` wrote the requested stack into the input slots with no inventory behind it — a survival
+player could summon any item, and any interface at any coordinate.
+
+**Fixed.** `feed` now **moves the acting player's own items**: it reads the player's inventory
+through the `horizon:entity_items` capability, caps the amount at what the player holds, takes the
+items in a transaction and writes the slots — nothing is created, and a slot the game refuses never
+costs the player an item (the write is reverted and the items go back). The interface must also be
+within [`REACH_BLOCKS`] (6.0 = vanilla's 4.5-block interaction range plus the server's own one-block
+buffer) of a player source; the console has no inventory and is refused for that reason.
+
+**Pinned by** the in-game phase F: after the interface is filled and the player's logs are spent,
+`/integratedcrafting feed … minecraft:oak_log 2` answers `the player holds no minecraft:oak_log to
+feed` and the interface stays `idle`; phase A asserts the player's oak logs are **0** after the feed
+(the slots took the items, not copies).
+
+### 2. `request`/`cancel` acted at any coordinates, and the queue had no cap
+
+**Reproduced:** `src/support.rs:328` registered `request` and `cancel` at level 0 and the body
+acted on any loaded interface; `src/runtime.rs:343` appended every accepted job with no limit, and
+submission checked the same inputs again for each job without reserving them — so a player could
+grow a blocked interface's saved NBT without bound.
+
+**Fixed, three parts:**
+
+- **Reach.** `request`, `cancel` and `feed` require a player source within [`REACH_BLOCKS`] of the
+  interface and answer `stand within 6 blocks of the interface.` otherwise. `status` stays open: it
+  is a readout of this mod's own block.
+- **A queue cap.** [`MAX_QUEUE`] = 8; a ninth request is refused with `Refusal::QueueFull`
+  (`the queue is full (8 jobs)`), so the saved compound and the per-tick rebuild are bounded.
+- **A real reservation.** `Engine::submit` now checks the new job against the slots **minus what
+  the queued jobs still need** (`free_inputs` → `reserve`, the same greedy walk the deficit uses),
+  and a job reserves only its *remaining* crafts (`crafts_needed - crafts`), so a craft releases
+  its reservation as it consumes the real item and a cancel releases all of it.
+
+**Pinned by** `the_queue_has_a_cap`, `a_queued_job_reserves_the_ingredients_it_still_needs` (two logs,
+a job for eight planks, a second request refused with `have 0`) and
+`a_reservation_is_released_as_the_job_crafts`; `a_player_must_be_within_reach_of_the_interface` for
+the distance rule. One existing test,
+`a_cancelled_job_never_consumes_anything`, now starts from four logs instead of two: with the
+reservation, a second job can no longer claim the logs the first one reserved — that is the fixed
+behaviour, and the test still proves what it was written for (a cancelled job consumes nothing).
+
+### 3. The entry says `kind = "mod"` for a `[native]` package
+
+The **package** was already consistent and is unchanged in this respect: `horizon-mod.toml` carries
+`api = "0.2"` with a `[native]` section (game 26.3, horizon `0b14f8a…`, mixins `e59da90…`) and no
+`kind` key — `kind` is derived from the package, and `cargo horizon-mod check` reports
+`integratedcrafting 0.2.1 (native-mod, format native-1/0b14f8a…/e59da90…, for 26.3)`. The entry's
+`kind` is the orchestrator's edit; the artefact and the manifest already agree.
+
+### 4. Three defects the in-game run found (this port had never run in game)
+
+1. **The game crashed at startup: `interface is attached to integratedcrafting:part_interface_crafting
+   twice`.** `expand_block_entity_parts` copies a block entity's Part into the block table under the
+   same name, so the extra `attach_block_part(block, "interface", …)` was refused and the refused
+   list aborted the launch. **Fixed** by attaching the Part once (through the block-entity type);
+   recorded in `src/lib.rs`.
+2. **The interface's slots never reached the tick.** A command's `BlockEntityRef::set_item_slot`
+   write was readable by the next command and invisible to `BlockEntityTickEvent.entity.items`, so
+   the next tick wrote an empty container back and a feed was wiped. **Fixed** by keeping the 13
+   slots in the block entity's **saved compound** (`ic_slots`, `ic_mirror`), which both a command
+   and the tick read and write; the tick mirrors them into the container hoppers reach and folds an
+   outside change back with `merge_container` (a slot whose container value differs from the mirror
+   was changed by a hopper and wins). Also measured: a `replace_data` *inside* a transaction is
+   rolled back by it, so the feed charges the player first and writes the payload outside.
+3. **A `replace_data` that replaced the whole payload dropped the slots** — the request after a feed
+   wiped the items because `save()` wrote a fresh compound holding only the queue. **Fixed** by
+   `save_engine`, which writes the queue into the existing compound and leaves every other key
+   alone.
+
+Pinned by the in-game run (A: two logs fed, a job accepted, `craft 0/2`; B: the interface idles and
+the planks reach the chest below) and by `the_saved_slots_round_trip`,
+`an_external_change_to_the_container_wins_over_the_saved_slots`,
+`a_first_tick_takes_the_container_as_it_stands`.
+
+### 5. Upstream defect fixed: the recipe could never load at 26.3
+
+The carried recipe wrote its ingredients in the 1.21.1 object form (`{"item": …}`, `{"tag": …}`). At
+26.3 an ingredient object must name a `type`/`neoforge:ingredient_type`
+(`crates/horizon-mod-vocab/src/__private/ingredient_parser.rs:186`), and a plain item is the
+**string** form — vanilla's own `data/minecraft/recipe/glass_pane.json` writes `"#":
+"minecraft:glass"`. Carried as-is, the engine logged `recipes: invalid ingredient (unresolved tag or
+malformed input)` and the interface's own recipe never loaded. **Fixed**: the key map is now
+`"C": "minecraft:crafting_table"`, `"I": "#c:ingots/iron"`, `"V"/"W": "integrateddynamics:cable"`,
+`"M": "integrateddynamics:crystalized_menril_chunk"`, same pattern, same result.
+
+### Ladder and in-game leg for 0.2.1
+
+| Step | Command | Result |
+|---|---|---|
+| unit tests RED | `cargo test --lib` before the cap/reservation | `error[E0425]`/`E0599`, 14 errors — `evidence/integratedcrafting/review-red-queue.log` |
+| unit tests | `cargo test --lib --offline` | **26 passed**, 0 failed (was 19; +7) |
+| lints | `cargo clippy --all-targets --offline -- -D warnings` | exit 0, 0 warnings |
+| formatting | `cargo fmt --check` | clean |
+| package | `cargo horizon-mod build` twice | `40,878 B`, sha256 `0798935e…d479d4fc`, **byte-identical** |
+| registry check | `cargo horizon-mod check integratedcrafting.hmod` | `native-mod, format native-1/0b14f8a…/e59da90…, for 26.3`, EXIT 0 |
+| fits | `cargo horizon-mod fits integratedcrafting.hmod --build nightly` | `0b14f8a made for`, EXIT 0 |
+| in-game | `ports/tools/launcher-game.sh run integratedcrafting` | **PASS** + `EXIT:0` — `evidence/integratedcrafting-e2e/e2e-launcher.log` |
+| control | `GAME=$CONTROL_GAME` | `FAIL: the crafting interface was not placed` + `EXIT:1` — `…-control.log` |
+| selftest | `SELFTEST=1` | `FAIL: A craft count … 'craft 7/9'` + `EXIT:1` — `…-selftest.log` |
+| log gate | `check-e2e-logs.py integratedcrafting-e2e --strict` | `logs=3 ok=3 missing-exit=0 bad-exit=0` |
+
+**Scope note:** the interface's slots keep an item id and a count, so a stack's components (a
+damaged tool, an enchanted book) are not preserved through the job — the engine's model, unchanged
+by this package and recorded under `## Known gaps`.
+
+## Slice 2: the job dependency graph (2026-11-21) — package 0.2.2
+
+**Pin:** Horizon `0a875da91dbb0fdcb7ba8c42c11341aa229af51a` (Nightly 2026-11-20) + horizon-mixins
+`e59da9094f0c2fdda6c627fe9eff22dec6a906f0`; `package_format` 6, `content_api` 0.2. The manifest
+moved from `0b14f8a`; `cargo horizon-mod update --horizon 0a875da…` reported *"2 of the 308 items it
+uses changed"* — both are the local-type collision `fits` reports (below), so **no source change was
+needed for the repin**. `.horizon/sdk` was re-seeded from `ports/_shared/sdk/0a875da/`; the copy
+keeps the release's 1970 mtimes, which leaves a **stale `OUT_DIR`** for `horizon-mod-vocab` (nine
+errors about `MobTickCost`, `#[raw_text]`, …); `touch`ing the seeded tree fixes it (paid for here).
+
+**Deliverable:** `integratedcrafting.hmod`, **46,984 B**, SHA-256
+`d69d48d54a4ec2f0ba3c937dfb92c8e5044c4d19d63a806d439bc99371082ebc`, 20 entries, no `Cargo.lock`.
+
+### The gap this slice closes
+
+`## Gaps (next slices)` item 4, verbatim from 0.2.1:
+
+> 4. **The job dependency graph** — a job whose ingredient is itself craftable
+>    (`CraftingJobDependencyGraph`, `PartialCraftingJobCalculation`) is not implemented: a request
+>    that needs a crafted intermediate is refused as missing ingredients. This is the largest
+>    remaining piece of the engine.
+
+### What it does
+
+- **`Engine::submit` plans the whole chain before it accepts anything.** A missing ingredient cell
+  whose item is itself craftable becomes a dependency, planned first and stored with the job; the
+  chain runs leaf first and the requested recipe last. A cell's candidate items are tried in their
+  sorted order (the table's cells are sorted, so a saved job does not depend on a set's iteration
+  order), and the first one whose own plan fits the slots wins: a log in the slots makes
+  `minecraft:oak_planks` the plank to craft, not the alphabetically earlier acacia plank whose log
+  the slots do not hold.
+- **The reservation is a simulation of the queue.** The old "crafts left × recipe" reservation
+  cannot describe a chain, so `free_inputs` walks every queued job's remaining steps in order,
+  takes what they consume and adds what their dependency steps will produce. A queued chain
+  therefore reserves the *leaf* items it still needs, and a dependency's output is not counted
+  twice.
+- **Execution is one step at a time.** A dependency's craft puts its product into the ingredient
+  slots (where the step above spends it); the requested recipe's product goes to the result slots.
+  The readout names the step (`step 1/2`) and the step's own craft count; the acceptance reply
+  names the plan (`(crafts: 1x minecraft:oak_planks, 1x minecraft:stick)`).
+- **Bounds:** `MAX_DEPENDENCY_DEPTH` = 8, and an output already on the chain is not followed
+  (a recipe cycle is refused with the missing cell, not a hang). A dependency whose product cannot
+  fit in the ingredient slots blocks with `ingredient slots full` and consumes nothing.
+- **Saves:** a job is stored as its `steps` (recipe, cells, crafts, progress, sink, limit); a job
+  compound written by 0.2.1 (one recipe at the top level) is read as a one-step job, so an upgrade
+  keeps a running job.
+
+### Upstream source read (analysis aid, clean-room rewrite)
+
+Repository `https://github.com/CyclopsMC/IntegratedCrafting`, commit
+`01effd6901581a0986a25e3a007ef0897d3ee6fa` (2026-10-31, shallow clone under `/tmp`, deleted after
+this record). Files read: `core/CraftingHelpers.java` (`calculateCraftingJob`,
+`calculateCraftingJobForRecipe`, `calculateCraftingJobDependency…`),
+`core/PartialCraftingJobCalculation.java`, `api/crafting/CraftingJobDependencyGraph.java`.
+
+Behaviours extracted and followed: a recipe's inputs are simulated against storage; every missing
+ingredient is resolved recursively into a dependency job **before** the parent job is created; a
+dependency failure aborts the whole calculation with the missing pieces; dependencies' surplus is
+fed back into the simulation so sibling dependencies do not double-count; a recursive recipe throws
+and is refused. Deviations from upstream, deliberately:
+
+| Upstream | Here | Why |
+|---|---|---|
+| Dependencies are separate `CraftingJob`s linked in a network-wide graph, one job per unique recipe, amounts merged when the same recipe appears again | the chain is a list of `Step`s of the one job | there is no network to hold separate jobs; one request, one saved job, one queue entry (and the queue cap stays 8) |
+| Orders are pulled from the network as the dependencies complete | a dependency's product is inserted into the interface's own ingredient slots | the network gap (item 1) |
+| A dependency can itself carry further dependencies without a fixed bound | at most `MAX_DEPENDENCY_DEPTH` = 8 | the whole chain is saved in the block entity; a bound keeps that compound finite |
+| Surplus from an over-producing dependency stays in the network | surplus stays in the ingredient slots (visible in the readout's slot data) | same inputs, same honesty a crafting table has |
+
+### Red proofs
+
+**Unit (before the planner existed), verbatim** — `sdk-test-red-dependency.log`:
+
+```
+test runtime::tests::a_request_crafts_a_craftable_intermediate_before_the_requested_recipe ... FAILED
+thread 'runtime::tests::a_request_crafts_a_craftable_intermediate_before_the_requested_recipe' panicked at src/runtime.rs:1321:14:
+one log makes four planks, and two of those make four sticks: MissingIngredients([Missing { candidates: ["minecraft:oak_planks"], needed: 2, have: 0 }])
+test result: FAILED. 29 passed; 5 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+**In game, the same phase against the pre-slice package** (0.2.1's engine at the new pin; log
+`e2e-launcher-red-old-code.log`):
+
+```
+== G: one log and a request for four sticks runs the planks first ==
+  G feed: Gave 1 [Oak Log] to Player62591 / Integrated Crafting: inserted 1 of 1
+FAIL: G request: the reply did not contain 'job 1 accepted for 4 x minecraft:stick': Integrated Crafting: missing 2 x minecraft:acacia_planks|minecraft:bamboo_planks|minecraft:birch_planks|minecraft:cherry_planks|minecraft:crimson_planks|minecraft:dark_oak_planks|minecraft:jungle_planks|minecraft:mangrove_planks|minecraft:oak_planks|minecraft:pale_oak_planks|minecraft:poplar_planks|minecraft:spruce_planks|minecraft:warped_planks (have 0)
+EXIT:1
+```
+
+### An in-game defect this slice found and fixed: the hopper duplicated the result
+
+Phase B of the old run had left the evidence in its own log, unread because the assertion only
+asked *whether* planks were in the chest, not *how many*:
+
+```
+  chest 300,99,0: 300, 99, 0 has the following block data: [{count: 12, Slot: 0b, id: "minecraft:oak_planks"}]
+```
+
+An eight-plank job left **twelve** planks. The cause: the block entity's container mirror
+(`ic_mirror`) recorded the container's content *before* the tick wrote into it, and the result
+slots were never merged back from the container at all — so every tick the interface re-inserted
+the stack a hopper had just taken, and the hopper drained it again. The same refill showed in the
+first run of phase I: a one-interface craft left **four** interfaces in the chest (`count: 4`, the
+development run before the fix; the preserved red is phase B's twelve planks above).
+
+**Fixed:** the tick now merges the result slots as well as the ingredient slots, against the state
+the interface itself last wrote (`write_items` is given the slots it overwrote `ic_mirror` with;
+the `feed` path writes only `ic_slots` and leaves the mirror alone). **Pinned by the exact chest
+counts** in phases B (8), G (4) and I (1) — an assertion that fails on the old package and on any
+future refill, and by `a_mirror_of_the_written_state_lets_a_hopper_take_a_result`.
+
+### The carried recipe, proven in game
+
+The package's one recipe names the parent port's items, so it needs a game with **both** packages.
+`native-build` accepts "a folder of them", so the slice built one game carrying `integratedcrafting`
+and `integrateddynamics` (both at the campaign pin) and ran the same script with `PARENT_ITEMS=1`:
+
+```
+== I: the carried recipe, crafted by the interface ==
+  I feed cable: … Integrated Crafting: inserted 2 of 2
+  I feed crafting table: … inserted 2 of 2
+  I feed iron: … inserted 4 of 4
+  I feed menril chunk: … inserted 1 of 1
+  I request: Integrated Crafting: job 1 accepted for 1 x integratedcrafting:part_interface_crafting
+  I status: Integrated Crafting: interface at 302,101,0: idle
+  chest 302,99,0: 1 x integratedcrafting:part_interface_crafting
+  I ingredients consumed: 302, 101, 0 has the following block data: [{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}]
+```
+
+Before the fix to the phase (the first attempt fed 2 iron and 1 table), the reply itself proved the
+recipe had loaded and resolved its tag: *"missing 4 x minecraft:iron_ingot (have 2); missing 2 x
+minecraft:crafting_table (have 1)"* — four iron cells through `#c:ingots/iron`, two table cells.
+The single-package leg skips phase I and says so (`I skipped: integrateddynamics:cable is absent
+from this single-package game`).
+
+### The loot table, measured
+
+Phase H rolls the carried table with `/loot give @s loot
+integratedcrafting:blocks/part_interface_crafting` → one interface, and with
+`…:blocks/no_such_table` → nothing (the differential). See `dialect-flags.md`: the checker's two
+flags on that file (`bonus_rolls`, float `rolls`) are not fatal at 26.3.
+
+### `fits --build 0b14f8a` is red, and a proved false positive
+
+`cargo horizon-mod fits integratedcrafting.hmod --build 0b14f8a` reports *"2 items changed"*:
+`type:Item` matched from `CommandArgumentValue::Item(stack)` in `src/support.rs` and `type:Recipe`
+matched from this crate's own pure `Recipe` type. Both surface entries are **byte-identical** in
+`0a875da` and `0b14f8a` (hash `af9ca6ca…` each), and the `item` command argument works in every
+leg. The proof, with the two surface hashes and the game transcript, is
+`evidence/integratedcrafting/fits-other-FALSE-POSITIVE.md`.
+
+### Ladder and in-game legs for 0.2.2
+
+| Step | Command | Result | Evidence |
+|---|---|---|---|
+| unit tests RED | `cargo test --lib` before the planner | **5 failed**, 29 passed; the chain test refused with `MissingIngredients` | `sdk-test-red-dependency.log` |
+| unit tests | `cargo test --lib --offline` | **37 passed**, 0 failed (was 26; +8 runtime, +3 glue) | `sdk-test.log` |
+| lints | `cargo clippy --all-targets --offline -- -D warnings` | exit 0, 0 warnings | `final-clippy.log` |
+| formatting | `cargo fmt --check` | exit 0 | `final-fmt.log` |
+| package | `cargo horizon-mod build` twice, `rm -f Cargo.lock` before each | both **46,984 B**, `d69d48d5…082ebc`, `cmp` → `BYTE-IDENTICAL` | `sdk-build-repro.log` |
+| registry check | `cargo horizon-mod check integratedcrafting.hmod` | `native-mod, format native-1/0a875da…/e59da90…, for 26.3`, EXIT 0 | `sdk-check.log` |
+| fits (pin) | `cargo horizon-mod fits … --build 0a875da` | `0a875da  made for`, EXIT 0 | `sdk-fits.log` |
+| fits (other) | `cargo horizon-mod fits … --build 0b14f8a` | `does not fit: 2 items changed` — the proved false positive, EXIT 1 | `sdk-fits-other.log`, `fits-other-FALSE-POSITIVE.md` |
+| in-game | `ports/tools/launcher-game.sh run integratedcrafting` | **PASS** + `EXIT:0` (A–H, I skipped) | `e2e-launcher.log` |
+| in-game + parent | both packages in one native build, `PARENT_ITEMS=1` | **PASS** + `EXIT:0` (A–I, recipe crafted) | `e2e-launcher-with-parent.log` |
+| control | `GAME=$CONTROL_GAME` | `FAIL: the crafting interface was not placed` + `EXIT:1` | `e2e-launcher-control.log` |
+| selftest A | `SELFTEST=1` | `FAIL: A craft count … 'craft 7/9'` + `EXIT:1` | `e2e-launcher-selftest.log` |
+| selftest G | `SELFTEST=dependency` | `FAIL: G plan (selftest) …` + `EXIT:1` | `e2e-launcher-selftest-dependency.log` |
+| log gate | `check-e2e-logs.py integratedcrafting-e2e --strict` | `logs=6 ok=6 missing-exit=0 bad-exit=0` | — |
+| build == delivered | `cmp` of the built game's `src/` + manifests | `same src/lib.rs`, `src/runtime.rs`, `src/support.rs`, both manifests | `build-matches-delivered.log` |
+| gate | `verify-sdk-package.py integratedcrafting` | **1/1** | — |
+
+### Harness defects fixed in this slice (the e2e had been passing vacuously)
+
+1. **Phase D's "job 1 accepted" matched phase A's stale chat line.** `ic()` read the last twelve
+   chat lines, so an old reply could pass for a new one (the `botanypots` lesson). The script now
+   reads only the chat events that arrived after the command (`ctl events --since`, with the
+   sequence kept in a file because `ic` runs in a command substitution), and phase D asserts
+   `job 2 accepted` — which is the reply the interface actually gives. The stale-chat version is
+   what made the old leg look green on a reply it never received.
+2. **"The chest holds planks" did not name a count**, which is how the duplication above survived.
+   `expect_in_chest` now takes the expected count and fails if the chest ever holds more than the
+   job made; the chest is read with a fresh `data get`.
+
+### Coverage (family → state)
+
+| Family (jar) | State |
+|---|---|
+| crafting-job engine: request → recipe, reservation, 20 ticks/craft, blocked reasons, queue cap, cancel | **tested** — 37 unit tests; e2e A–F |
+| job dependency graph (craftable intermediate), depth cap, cycle refusal | **tested** — 8 unit tests + 3 glue; e2e G (one log → planks → 4 sticks, 2 planks left, log consumed) |
+| commands `status`/`request`/`cancel`/`feed`, reach rule, no item creation | **tested** — e2e A–F/G; unit tests |
+| block entity, 13-slot container, hopper faces, result handoff without duplication | **tested** — e2e A/B (exactly 8 planks in the chest), G (4 sticks), I (1 interface) |
+| carried block, item, state, model and lang | **tested** — placed/read/given in e2e A; the item comes back through the loot roll (H) and the craft (I) |
+| carried recipe `part_interface_crafting` (incl. `#c:ingots/iron`) | **tested** — e2e I, in a game with the parent package; 9 ingredients consumed |
+| carried loot table | **tested** — e2e H, with an unknown-table differential |
+| saved jobs, including a job saved by 0.2.1 | **tested** — `a_saved_queue_reads_back_as_it_was_written`, `a_saved_chain_reads_back_with_its_steps`, `a_job_saved_by_the_previous_package_reads_as_one_step` |
+| network attachment, crafting writer/aspects, part screens, attuned/enumerated variants | **blocked / not ported** — gaps 1–3 |
+| priorities, distributed jobs, several CPUs, blocking-mode settings, re-usable ingredients, fluids, energy, bound machine, other recipe types, advancements/info book | **not ported** — gaps 5–8 |
+
+Note on the test count: 26 → 37 is +11 — eight runtime tests for the chain (five red first, three
+refusal/bound tests) and three glue tests (the 0.2.1 save format, a saved chain, and the result
+handoff policy). The runtime module holds 28 tests, the glue 9.
+
 ## Gaps (next slices)
 
 1. **`blocked(no-parent-network-attachment-api)`** — the network half: a part on
@@ -169,10 +488,10 @@ Checked, and **none found** that this slice would reproduce. What was checked, f
 3. **The part screens** — upstream has five containers and their screens
    (`ContainerPartInterfaceCrafting`, `…Settings`, `…AttunedRecipes`, `…AttunedOffsets`; the jar's
    GUI textures). Slice 1 has the container and the commands, no screen.
-4. **The job dependency graph** — a job whose ingredient is itself craftable
-   (`CraftingJobDependencyGraph`, `PartialCraftingJobCalculation`) is not implemented: a request
-   that needs a crafted intermediate is refused as missing ingredients. This is the largest
-   remaining piece of the engine.
+4. ~~**The job dependency graph** …~~ **done in slice 2** (2026-11-21): a request whose ingredient
+   is itself craftable plans the chain (bounded at 8, cycles refused); see "Slice 2". What is left
+   of it is the network form of it: separate jobs, one per unique recipe, merged amounts, priorities
+   (gaps 1 and 5).
 5. **Priorities, distributed jobs over several interfaces, several crafting CPUs, blocking-mode
    settings, re-usable ingredients, fluids and energy** (`ICraftingNetwork`, `CraftingNetwork`).
 6. **The bound machine** — inserting the inputs into the block the interface faces through the item
@@ -208,9 +527,9 @@ block hooks; `BlockEntityRef` reads take `&dyn Host` while `set_item_slot` takes
 
 ## Skills
 
-Skills: superpowers/using-superpowers,brainstorming,writing-plans,test-driven-development,systematic-debugging,verification-before-completion; BeautifulRust/rust-best-practices,rust-port
+Skills: superpowers/using-superpowers,brainstorming,writing-plans,test-driven-development,verification-before-completion; BeautifulRust/rust-best-practices
 
-## Verification
+## Verification (slice 1, package 0.2.0 — historical; 0.2.2 is in "Slice 2" and `VALIDATION.md`)
 
 Every build, test and package step ran through `ports/tools/build-slot.sh` with `BUILD_LOCAL=1`,
 `CARGO_INCREMENTAL=0`, `rm -f Cargo.lock` before each package build, no bare `cargo` outside a
@@ -259,9 +578,15 @@ Integrated Crafting:
 - **no `Cargo.lock`** inside (a lock would pin newer crates than the SDK's own and change the sha).
 - `cargo horizon-mod check` and `fits` accept it at `0b14f8a`.
 
-## What still needs an in-game run
+## What still needs an in-game run (slice 1's status — superseded by slice 2)
 
-**The content half is verified; the native half is not.** The content-only variant of this package
+**Settled at 0.2.2:** the native half now runs in a launcher-built game (`tools/e2e.sh`, phases
+A–I; `e2e-launcher.log`, `e2e-launcher-with-parent.log`). The three risks below were all measured
+green: the block entity comes from the declared type and ticks; the 13 slots line up with
+`event.entity.items` and the hopper faces; the model and texture load (a windowed run was still not
+made — a headless run has no renderer, so the *look* remains unproven, only the state/model data).
+
+The slice-1 text is kept for the record: **the content half is verified; the native half was not.** The content-only variant of this package
 (the same `assets/` and `data/`, no `[native]`) was launched on the **shared unmodded game** at the
 pin under a scratch home, and its block, state name, item and display name all came from the
 package — with the counterfactual that the same binary without the package answers `Unknown block
@@ -298,15 +623,33 @@ The slice boundary and gaps above stand. Recorded for this slice:
 
 - `TICKS_PER_CRAFT` is fixed at 20; upstream measures each machine.
 - one job at a time, no priorities, no distribution, no dependency graph;
-- a job's ingredients can be taken by an earlier queued job between submission and the craft (the
-  engine does not reserve slots); the job then blocks and names the deficit — which is the honest
-  report, not a silent failure;
+- a job reserves its remaining leaf ingredients (0.2.1), so an earlier queued job cannot take them;
+  a blocked job still names the exact deficit when the slots do not have it;
 - `minecraft:crafting` only; a `RecipeRule` type (stonecutting, smithing, special) resolves to no
   recipe and is refused as `no crafting recipe makes …`;
 - the interface has no screen, no comparator output and no block state for `running`/`blocked`; its
   state is in the readout and in the saved compound;
 - the ingredient item ids in a job's saved cells are sorted, so a job and its readout do not depend
   on a set's iteration order.
+
+## Changelog for 0.2.2
+
+> **Update `integratedcrafting` 0.2.2** (supersedes 0.2.1; 0.2.1 was never published on its own).
+>
+> - **The job dependency graph.** A request whose ingredient is itself craftable plans the chain and
+>   runs it leaf first: one log becomes planks, the planks become four sticks, in one job. The
+>   acceptance reply names the plan, the readout names the step (`step 1/2`), the chain is bounded
+>   at eight steps, a recipe cycle is refused rather than followed, and a queued chain reserves the
+>   leaf items it still needs.
+> - **Fixed: a hopper under the interface duplicated the job's output.** An eight-plank job left
+>   twelve planks in the chest and a one-interface craft left four interfaces, because the result
+>   slots were never folded back from the container and the mirror held the pre-write state. The
+>   tick now merges both halves against the state it wrote; the e2e asserts the exact chest counts.
+> - **Proven in game**: the carried recipe (crafted through the interface, in a game with the
+>   parent package), the carried loot table (rolled, with an unknown-table differential), the block
+>   entity, the 13-slot container and the hopper handoff.
+> - Repinned to Horizon `0a875da` (Nightly 2026-11-20) + mixins `e59da909…`; `api = "0.2"`,
+>   `package_format` 6. No source change was needed for the repin.
 
 ## Changelog for the first publication
 

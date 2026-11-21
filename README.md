@@ -1,68 +1,88 @@
-# Integrated Crafting — a Horizon port
+# Integrated Crafting → Horizon (slices 1–2)
 
-**Integrated Crafting** is a Minecraft mod. Craft stuff in Integrated Dynamics networks. This repository is a **port of it to [Horizon](https://github.com/horizon-rust/horizon)**, the Rust engine for Minecraft Java 26.3. It carries the complete source of the port plus the content files it ships, and installs as a single `.hmod` package.
+A Horizon port of **Integrated Crafting 1.8.1** (`CyclopsMC/IntegratedCrafting`,
+**MIT**), Minecraft 1.21.1 NeoForge, from the exact ATM10 pack jar.
 
-Upstream: [CyclopsMC/IntegratedCrafting](https://github.com/CyclopsMC/IntegratedCrafting) — licence **MIT**.
+**The port is the crafting-job engine and its interface block.** A **Crafting
+Interface** accepts a request for *N* of an item, resolves it against the game's
+own crafting recipes, keeps that recipe for the job's life, holds the ingredients
+in its own slots, crafts one recipe at a time, blocks with the reason when it
+cannot continue, and reports its queue through `/integratedcrafting status`.
 
-| | |
+**Slice 2 adds the job dependency graph**: a request whose ingredient is itself
+craftable plans that dependency first — one log becomes planks, the planks become
+four sticks — and the acceptance reply names the whole chain. A chain deeper than
+eight steps, or one that needs itself, is refused with its deficit rather than
+followed.
+
+The network half is the recorded gap: upstream the interface is a part on an
+Integrated Dynamics cable that pulls its ingredients from the network's storage
+and inserts them into a bound machine. This pin has **no cross-mod API**, so a
+part cannot join the parent's network — see `notes.md`,
+`blocked(no-parent-network-attachment-api)`. What remains is the mod's job
+engine, run standalone over the interface's own container.
+
+What is not here: the variable-card layer, the part screens, the attuned and
+enumerated variants, the crafting writer's aspects, priorities, distributed
+jobs, reusable ingredients, fluids and energy, and the terminals integration.
+
+## The package
+
+One flat `.hmod` (Horizon mod API 0.2), content and code together:
+
+```text
+integratedcrafting.hmod
+  horizon-mod.toml   the manifest and the only identity (0.2.2)
+  Cargo.toml         horizon-mod-api from .horizon/sdk/ (fetched, never shipped)
+  src/lib.rs         the one #[mod_api::horizon_mod] impl Hooks + the interface's Part
+  src/runtime.rs     the pure job engine, its chain planner and their 28 tests
+  src/support.rs     the glue: the saved queue, the slots, the recipe table, the commands
+  assets/integratedcrafting/   the interface's blockstate, models, texture, lang
+  data/integratedcrafting/     the block, creative tab, loot table and recipe
+  LICENSE, LICENSE-NOTICE.md
+```
+
+## Commands
+
+| Command | What it does |
 |---|---|
-| Upstream mod | Integrated Crafting ([source](https://github.com/CyclopsMC/IntegratedCrafting)) |
-| Ported to | Horizon 0b14f8a, Minecraft Java 26.3, mod API `0.2` |
-| Package | `integratedcrafting.hmod` (install it with the Horizon launcher) |
-| Licence | **MIT** — the upstream mod's licence; see [Licence and credit](#licence-and-credit) |
+| `/integratedcrafting status <x> <y> <z>` | the readout: queue, the running job's step, craft and progress, the blocked reason |
+| `/integratedcrafting request <x> <y> <z> <item> <count>` | resolve the item's recipe (and its dependencies) and queue a job (refused, with the deficit, when the slots cannot pay) |
+| `/integratedcrafting cancel <x> <y> <z>` | drop every unfinished job; the ingredients stay in the slots |
+| `/integratedcrafting feed <x> <y> <z> <item> <count>` | move items from your own inventory into the ingredient slots, as a hopper above the interface does (you must be within 6 blocks; nothing is created) |
 
-## What this port implements
+Hoppers are the ordinary route: a hopper above fills the nine ingredient slots,
+hoppers below and beside take the four result slots.
 
-- **`integratedcrafting:part_interface_crafting`** — a part-shaped block (the carried part model:
-- **The engine** (`src/runtime.rs`, 14 tests, no game types): a request resolves to a recipe and
-- **The tick** (`src/support.rs`): rebuilds the engine from the compound, advances it once, writes
-- **`/integratedcrafting status <pos>`** — the readout: the queue, the running job's craft and
-- **`/integratedcrafting request|cancel|feed`** — submit a job, drop every unfinished job, and put
-- **Content**: the interface's texture (byte-identical), model geometry (the jar's ten cubes), a
-- `struct Cable` with `#[mod_api::horizon_part] impl BlockPart` (`block_signal`, `is_signal_source`,
-- A redstone **channel** in the cable's saved compound under the key `value` (0..15) and a `status`
+## Building, checking and running
 
-## Not yet ported
-
-- **`blocked(no-parent-network-attachment-api)`** — the network half: a part on
-- **`blocked(no-variable-card-layer)`** — the Crafting Writer part and every aspect the mod ships
-- **The part screens** — upstream has five containers and their screens
-- **The job dependency graph** — a job whose ingredient is itself craftable
-- **Priorities, distributed jobs over several interfaces, several crafting CPUs, blocking-mode
-- **The bound machine** — inserting the inputs into the block the interface faces through the item
-- **Recipe types other than `minecraft:crafting`** (`smelting`, `stonecutting`, `smithing` are in
-- **Advancements, the info book, the gametests** (7 advancements, 2 XMLs, 47 KB of gametests) are
-
-## Installing
-
-1. Install the [Horizon launcher](https://github.com/horizon-rust/horizon/releases) (0.2.70 or newer).
-2. Add `integratedcrafting.hmod` to the instance's mods.
-3. The package is pinned to a specific Horizon build; the launcher checks that pin.
-
-## Licence and credit
-
-Integrated Crafting was created by its upstream authors; the code, models and assets in the original mod
-remain theirs and are used here under **MIT**. The Rust in this repository is a clean-room
-rewrite for Horizon, not a translation of the original source.
-
-- `LICENSE` — the upstream licence text.
-- `LICENSE-NOTICE.md` — what this port carries and where it came from.
-- The upstream project: https://github.com/CyclopsMC/IntegratedCrafting
-
-## Technical details
-
-```
-horizon-mod.toml   package manifest (id, version, api, [native] pin)
-Cargo.toml         the crate; depends on `horizon-mod-api` from the fetched SDK
-src/               lib.rs (the one `impl Hooks`), runtime.rs (pure logic + tests), glue
-assets/ data/      the content the package ships
-tools/             content generators and the e2e scenario
+```sh
+BUILD_LOCAL=1 ports/tools/build-slot.sh run --job sdk-ic --port ports/integratedcrafting \
+    --step test -- bash -lc 'cd ports/integratedcrafting && cargo test --lib --offline'
+BUILD_LOCAL=1 ports/tools/build-slot.sh run --job sdk-ic --port ports/integratedcrafting \
+    --step check -- bash -lc 'cd ports/integratedcrafting && cargo clippy --all-targets -- -D warnings'
+rm -f ports/integratedcrafting/Cargo.lock
+BUILD_LOCAL=1 ports/tools/build-slot.sh run --job sdk-ic --port ports/integratedcrafting \
+    --step build -- bash -lc 'cd ports/integratedcrafting && cargo horizon-mod build'
+cp ports/integratedcrafting/target/horizon-mod/integratedcrafting.hmod ports/integratedcrafting/
+cargo horizon-mod check ports/integratedcrafting/integratedcrafting.hmod
+cargo horizon-mod fits ports/integratedcrafting/integratedcrafting.hmod --build 0a875da
 ```
 
-- Build: `cargo horizon-mod build` (packages; it does not compile against the game).
-- Test: `cargo test`, `cargo clippy --all-targets -- -D warnings`.
-- In-game: `ports/tools/launcher-game.sh run integratedcrafting` in the campaign tree, or install the
-  `.hmod` and play; the harness scenario is `tools/e2e.sh`.
+The in-game scenario (`tools/e2e.sh`) runs on a **launcher-built** game:
 
-This repository is generated from the campaign's port at `ports/integratedcrafting/`; the port's own
-`notes.md` is the full record (decisions, traps, evidence).
+```sh
+ports/tools/launcher-game.sh run integratedcrafting
+```
+
+It proves, in a real world, the interface's placement and state, jobs A–F, the
+dependency chain, the loot table (with an unknown-table differential), and — in a
+game with the parent port installed (`PARENT_ITEMS=1`) — the package's own
+carried recipe, crafted through the interface. The evidence and the ladder are in
+`notes.md` and `VALIDATION.md`.
+
+The jar is evidence at
+`ports/_shared/licence-cache/integratedcrafting-1.21.1-neoforge-1.8.1.jar`
+(SHA-256 in `LICENSE-NOTICE.md`).
+
+**Local-only** until the maintainer approves publishing (ARCHITECTURE.md §8).
